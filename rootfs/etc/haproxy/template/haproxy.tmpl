@@ -319,7 +319,7 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
 {{- if and $isCACert (not $hasSSL) }}
     bind unix@/var/run/haproxy-http-ca-{{ $singleserver.HostnameSocket }}.sock accept-proxy
 {{- else if $hasSSL }}
-    bind unix@/var/run/haproxy-https-{{ $singleserver.HostnameSocket }}.sock ssl alpn h2,http/1.1 crt {{ $singleserver.SSLCertificate }}{{ if $isCACert }} ca-file {{ $singleserver.CertificateAuth.AuthSSLCert.CAFileName }} verify optional ca-ignore-err all crt-ignore-err all{{ end }} accept-proxy
+    bind unix@/var/run/haproxy-https-{{ $singleserver.HostnameSocket }}.sock ssl alpn {{ $cfg.TLSALPN }} crt {{ $singleserver.SSLCertificate }}{{ if $isCACert }} ca-file {{ $singleserver.CertificateAuth.AuthSSLCert.CAFileName }} verify optional ca-ignore-err all crt-ignore-err all{{ end }} accept-proxy
 {{- else }}
     bind unix@/var/run/haproxy-http-{{ $singleserver.HostnameSocket }}.sock tfo accept-proxy
 {{- end }}
@@ -533,9 +533,9 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
 {{- $rewriteTarget := $location.Rewrite.Target }}
 {{- if ne $rewriteTarget "" }}
 {{- if eq $rewriteTarget "/" }}
-    reqrep ^([^\ :]*)\ {{ $location.Path }}/?(.*$) \1\ {{ $rewriteTarget }}\2 if {{ if $location.SSLRedirect }}from-https {{ end }}{{ $server.ACLLabel }} { var(txn.path) -m beg {{ $location.Path }} }
+    reqrep ^([^\ :]*)\ {{ $location.Path }}/?(.*$) \1\ {{ $rewriteTarget }}\2 if {{ if $location.SSLRedirect }}from-https {{ end }}{{ $server.ACLLabel }}{{ $location.HAMatchTxnPath }}
 {{- else }}
-    reqrep ^([^\ :]*)\ {{ $location.Path }}(.*$) \1\ {{ $rewriteTarget }}{{ if hasSuffix $location.Path "/" }}/{{ end }}\2 if {{ if $location.SSLRedirect }}from-https {{ end }}{{ $server.ACLLabel }} { var(txn.path) -m beg {{ $location.Path }} }
+    reqrep ^([^\ :]*)\ {{ $location.Path }}(.*$) \1\ {{ $rewriteTarget }}{{ if hasSuffix $location.Path "/" }}/{{ end }}\2 if {{ if $location.SSLRedirect }}from-https {{ end }}{{ $server.ACLLabel }}{{ $location.HAMatchTxnPath }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -597,7 +597,7 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
 {{- range $server := $servers }}
 {{- range $location := $server.Locations }}
 {{- if ne $location.Proxy.BodySize "" }}
-    use_backend error413 if {{ $server.ACLLabel }} { var(txn.path) -m beg {{ $location.Path }} } { req.body_size gt {{ sizeSuffix $location.Proxy.BodySize }} }
+    use_backend error413 if {{ $server.ACLLabel }}{{ $location.HAMatchTxnPath }} { req.body_size gt {{ sizeSuffix $location.Proxy.BodySize }} }
 {{- end }}
 {{- end }}
 {{- end }}
