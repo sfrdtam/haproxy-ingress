@@ -1,10 +1,18 @@
-# HAProxy Ingress controller
+# HAProxy Ingress controller - Forked
+
 
 [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/) controller
 implementation for [HAProxy](http://www.haproxy.org/) loadbalancer.
 
 [![Build Status](https://travis-ci.org/jcmoraisjr/haproxy-ingress.svg?branch=master)](https://travis-ci.org/jcmoraisjr/haproxy-ingress) [![Docker Repository on Quay](https://quay.io/repository/jcmoraisjr/haproxy-ingress/status "Docker Repository on Quay")](https://quay.io/repository/jcmoraisjr/haproxy-ingress)
 
+# Fork
+
+The fork has been done to support multi domain balancing and https offloading,
+for a bar-metal deployment with network and firewall constraints 
+
+\#sfr #inovatel #sun
+ 
 # Releases
 
 HAProxy Ingress images are built by [Travis CI](https://travis-ci.org/jcmoraisjr/haproxy-ingress) and the

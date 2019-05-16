@@ -11,6 +11,8 @@ global
 {{- if ne $ing.Procs.CPUMap "" }}
     cpu-map {{ $ing.Procs.CPUMap }}
 {{- end }}
+    #chroot /var/lib/haproxy
+    #stats socket {{ $cfg.StatsSocket }} mode 660 level admin
     stats socket {{ $cfg.StatsSocket }} level admin expose-fd listeners{{ if gt $ing.Procs.Nbproc 1 }} process 1{{ end }}
 {{- if $cfg.LoadServerState }}
     server-state-file state-global
@@ -34,6 +36,8 @@ global
 {{- end }}
     ssl-default-bind-ciphers {{ $cfg.SSLCiphers }}
     ssl-default-bind-options {{ $cfg.SSLOptions }}
+    ssl-default-server-ciphers {{ $cfg.SSLCiphers }}
+    ssl-default-server-options {{ $cfg.SSLOptions }}
 {{- range $snippet := $ing.ConfigGlobal }}
     {{ $snippet }}
 {{- end }}
@@ -61,6 +65,8 @@ defaults
     timeout server-fin      {{ $cfg.TimeoutServerFin }}
     timeout tunnel          {{ $cfg.TimeoutTunnel }}
     timeout http-keep-alive {{ $cfg.TimeoutKeepAlive }}
+    monitor-uri /health
+
 {{- if ne (len $ing.DNSResolvers) 0 }}
 
 ######
@@ -127,6 +133,9 @@ listen tcp-{{ $tcp.Port }}
 {{- range $backend := $ing.Backends }}
 backend {{ $backend.Name }}
     mode {{ if $backend.SSLPassthrough }}tcp{{ else }}http{{ end }}
+{{- if gt $ing.Procs.Nbproc 1 }}
+    bind-process {{ $ing.Procs.BindprocBalance }}
+{{- end}}
     balance {{ $backend.BalanceAlgorithm }}
 {{- if ne $backend.Connection.TimeoutQueue "" }}
     timeout queue {{ $backend.Connection.TimeoutQueue }}
@@ -183,15 +192,27 @@ backend {{ $backend.Name }}
     {{- if ne $cfg.BackendCheckInterval "" }} check inter {{ $cfg.BackendCheckInterval }}{{ end }}
 {{- end }}
 
+
+{{- /*------------------------------------*/}}
+{{- range $server := $ing.HAServers }}
+{{- if $server.UseHTTPS }}
+
 ######
-###### HTTPS frontend (tcp mode)
+###### HTTPS frontend (tcp mode) - {{ $server.Hostname }}
 ######
-frontend httpsfront
-    bind {{ $cfg.BindIPAddrHTTP }}:{{ $cfg.HTTPSPort }}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }}
+frontend httpsfront-{{ $server.HostnameLabel }}
+    mode tcp
 {{- if gt $ing.Procs.Nbproc 1 }}
     bind-process {{ $ing.Procs.BindprocSSL }}
+    # haproxy use SO_REUSEPORT. Having on bind by process improves the balancing (see https://www.suse.com/c/speeding-ssl-need-know-haproxy/)
+    {{- range $i, $e := until $ing.Procs.NbprocSSL}}
+    {{- $proc := add $i (add $ing.Procs.NbprocBalance 1) }}
+    bind {{ $cfg.BindIPAddrHTTP }}:{{template "get_https_port" map $cfg.HTTPSPort $server.Hostname}}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }} tfo ssl alpn http/1.1 crt {{ $server.SSLCertificate }} process {{ $proc }}
+    {{- end}}
+{{- else }}
+    bind {{ $cfg.BindIPAddrHTTP }}:{{template "get_https_port" map $cfg.HTTPSPort $server.Hostname}}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }} tfo ssl alpn http/1.1 crt {{ $server.SSLCertificate }}
 {{- end }}
-    mode tcp
+    # CRT PEM checksum: {{ $server.SSLPemChecksum }} - {{ $server.Hostname }}
 
 {{- if ne $cfg.Syslog "" }}
 {{- if eq $cfg.HTTPSLogFormat "default" }}
@@ -201,42 +222,46 @@ frontend httpsfront
 {{- end }}
 {{- end }}
     tcp-request inspect-delay 5s
-    tcp-request content accept if { req.ssl_hello_type 1 }
 
-{{- range $server := $ing.HAServers }}
 {{- if $server.IsCACert }}
     {{- template "acl" map $cfg $server "req.ssl_sni" false }}
 {{- end }}
-{{- end }}
 
-{{- range $server := $ing.HAPassthrough }}
-{{- if $server.HostnameIsWildcard }}
-    use_backend {{ $server.Backend }} if { req.ssl_sni -m reg -i {{ hostnameRegex $server.Hostname }} }
+{{- range $serverPassThrough := $ing.HAPassthrough }}
+{{- if eq $server.Hostname $serverPassThrough.Hostname }}
+{{- if $serverPassThrough.HostnameIsWildcard }}
+    use_backend {{ $serverPassThrough.Backend }} if { req.ssl_sni -m reg -i {{ hostnameRegex $serverPassThrough.Hostname }} }
 {{- else }}
-    use_backend {{ $server.Backend }} if { req.ssl_sni -i {{ $server.Hostname }} }
+    use_backend {{ $serverPassThrough.Backend }} if { req.ssl_sni -i {{ $serverPassThrough.Hostname }} }
 {{- end }}
+{{- end }}{{/* if eq $server.Hostname $serverPassThrough.Hostname */}}
+{{- end }}{{/* range $serverPassThrough := $ing.HAPassthrough */}}
+
+{{- if $server.IsCACert }}
+    use_backend httpsback-ca-{{ $server.HostnameLabel }} if {{ $server.ACLLabel }}
 {{- end }}
+    default_backend httpback-{{ $server.HostnameLabel }}
+{{- end }}{{/* if $server.UseHTTPS */}}
+{{- end }}{{/* range $server := $ing.HAServers */}}
 
 {{- range $server := $ing.HAServers }}
-{{- if $server.IsCACert }}
-    use_backend httpsback-{{ $server.HostnameLabel }} if {{ $server.ACLLabel }}
-{{- end }}
-{{- end }}
-    default_backend httpsback-shared-backend
 
 ######
-###### HTTP(S) frontend - shared http mode
+###### HTTP frontend - http balancing - {{ $server.Hostname }}
 ######
-backend httpsback-shared-backend
-    mode tcp
-    server shared-https-frontend unix@/var/run/haproxy-https.sock send-proxy-v2
-{{- if gt $ing.Procs.NbprocSSL 0 }}
-    {{- template "http_front" map $ing $cfg nil false true }}
-{{- end }}
-backend httpback-shared-backend
+backend httpback-{{ $server.HostnameLabel }}
+    option tcp-smart-connect
     mode http
-    server shared-http-frontend unix@/var/run/haproxy-http.sock send-proxy-v2
-    {{- template "http_front" map $ing $cfg nil true (eq $ing.Procs.NbprocSSL 0) }}
+    http-request set-header X-Forwarded-Port {{template "get_https_port" map $cfg.HTTPSPort $server.Hostname}}
+    http-request set-header X-Forwarded-Proto https
+    http-request del-header {{ $cfg.SSLHeadersPrefix }}-Client-Cert
+    http-request del-header {{ $cfg.SSLHeadersPrefix }}-Client-SHA1
+    http-request del-header {{ $cfg.SSLHeadersPrefix }}-Client-DN
+    http-request del-header {{ $cfg.SSLHeadersPrefix }}-Client-CN
+    server {{ $server.HostnameLabel }} unix@/var/run/haproxy-http-{{ $server.HostnameSocket }}.sock send-proxy-v2
+
+{{- template "http_front" map $ing $cfg $server true (eq $ing.Procs.NbprocSSL 0) }}
+{{- end }}{{/* range $server := $ing.HAServers */}}
 
 {{- range $server := $ing.HAServers }}
 {{- if $server.IsCACert }}
@@ -244,66 +269,59 @@ backend httpback-shared-backend
 ######
 ###### HTTPS frontend - cacert - {{ $server.Hostname }}
 ######
-backend httpsback-{{ $server.HostnameLabel }}
+backend httpsback-ca-{{ $server.HostnameLabel }}
     mode tcp
-    server {{ $server.HostnameLabel }} unix@/var/run/haproxy-https-{{ $server.HostnameSocket }}.sock send-proxy-v2
+    server {{ $server.HostnameLabel }} unix@/var/run/haproxy-https-ca-{{ $server.HostnameSocket }}.sock send-proxy-v2
     {{- template "http_front" map $ing $cfg $server (eq $ing.Procs.NbprocSSL 0) true }}
 {{- if gt $ing.Procs.NbprocSSL 0 }}
-backend httpback-{{ $server.HostnameLabel }}
+backend httpback-ca-{{ $server.HostnameLabel }}
     mode http
-    server {{ $server.HostnameLabel }} unix@/var/run/haproxy-http-{{ $server.HostnameSocket }}.sock send-proxy-v2
+    server {{ $server.HostnameLabel }} unix@/var/run/haproxy-http-ca-{{ $server.HostnameSocket }}.sock send-proxy-v2
     {{- template "http_front" map $ing $cfg $server true false }}
 {{- end }}
 {{- end }}
 {{- end }}
 
-######
-###### HTTP frontend - default backend
-######
-backend httpback-default-backend
-    mode http
-    server shared-http-frontend unix@/var/run/haproxy-http-{{ $ing.DefaultServer.HostnameSocket }}.sock send-proxy-v2
-    {{- template "http_front" map $ing $cfg $ing.DefaultServer true false }}
 
 {{- /*------------------------------------*/}}
 {{- /*------------------------------------*/}}
 {{- define "http_front" }}
 {{- $ing := .p1 }}
 {{- $cfg := .p2 }}
+{{- /*$singleserver below is never nil*/}}
 {{- $singleserver := .p3 }}
 {{- $hasBalance := .p4 }}
 {{- $hasSSL := .p5 }}
-{{- $isShared := isShared $singleserver }}
-{{- $isDefault := isDefault $singleserver }}
 {{- $isCACert := isCACert $singleserver }}
+{{- /*servers below is deprecated and is always [$singleserver]*/}}
 {{- $servers := getServers $ing.HAServers $singleserver }}
 {{- $hasHTTPStoHTTP := gt $cfg.HTTPStoHTTPPort 0 }}
 {{- $reuseHTTPPort := eq $cfg.HTTPStoHTTPPort $cfg.HTTPPort }}
-frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShared }}shared-frontend{{ else if $isDefault }}default-backend{{ else }}{{ $singleserver.Hostname }}{{ end }}
+frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleserver.Hostname }}
 
 {{- /*------------------------------------*/}}
-{{- if and $hasBalance $isShared }}
+{{- if and $hasBalance }}
     bind {{ $cfg.BindIPAddrHTTP }}:{{ $cfg.HTTPPort }}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }}
 {{- if and $hasHTTPStoHTTP (not $reuseHTTPPort) }}
     bind {{ $cfg.BindIPAddrHTTP }}:{{ $cfg.HTTPStoHTTPPort }}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }}
 {{- end }}
-    bind unix@/var/run/haproxy-http.sock accept-proxy
 {{- end }}
 {{- if $hasSSL }}
 {{- range $server := $servers }}
 {{- if $server.UseHTTPS }}
-    # CRT PEM checksum: {{ $server.SSLPemChecksum }}{{ if $isShared }} - {{ $server.Hostname }}{{ end }}
+    # CRT PEM checksum: {{ $server.SSLPemChecksum }} - {{ $server.Hostname }}
 {{- end }}
 {{- end }}
 {{- end }}
 {{- if and $hasSSL $isCACert }}
     # CA PEM checksum: {{ $singleserver.CertificateAuth.AuthSSLCert.PemSHA }}
 {{- end }}
-{{- if or $isDefault (and $isCACert (not $hasSSL)) }}
-    bind unix@/var/run/haproxy-http-{{ $singleserver.HostnameSocket }}.sock accept-proxy
-{{- end }}
-{{- if $hasSSL }}
-    bind unix@/var/run/haproxy-https{{ if not $isShared }}-{{ $singleserver.HostnameSocket }}{{ end }}.sock ssl alpn h2,http/1.1 crt {{ if $isShared }}/ingress-controller/ssl/shared-frontend/{{ else }}{{ $singleserver.SSLCertificate }}{{ end }}{{ if $isCACert }} ca-file {{ $singleserver.CertificateAuth.AuthSSLCert.CAFileName }} verify optional ca-ignore-err all crt-ignore-err all{{ end }} accept-proxy
+{{- if and $isCACert (not $hasSSL) }}
+    bind unix@/var/run/haproxy-http-ca-{{ $singleserver.HostnameSocket }}.sock accept-proxy
+{{- else if $hasSSL }}
+    bind unix@/var/run/haproxy-https-{{ $singleserver.HostnameSocket }}.sock ssl alpn h2,http/1.1 crt {{ $singleserver.SSLCertificate }}{{ if $isCACert }} ca-file {{ $singleserver.CertificateAuth.AuthSSLCert.CAFileName }} verify optional ca-ignore-err all crt-ignore-err all{{ end }} accept-proxy
+{{- else }}
+    bind unix@/var/run/haproxy-http-{{ $singleserver.HostnameSocket }}.sock tfo accept-proxy
 {{- end }}
 {{- if gt $ing.Procs.Nbproc 1 }}
 {{- if and $hasBalance (not $hasSSL) }}
@@ -326,8 +344,45 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShar
 {{- end }}
 
 {{- /*------------------------------------*/}}
+{{- if $hasBalance }}
+    {{/* template "acl" map $cfg $singleserver "var(txn.hdr_host)" true */}}
+    {{/* the current front-end is not shared with other servers*/}}
+    acl {{ $singleserver.ACLLabel }} always_true
+{{- end }}
+
+{{- /*------------------------------------*/}}
+{{- if $hasBalance }}
+{{- if not (contains "sun-push" $singleserver.Hostname ) }}
+    # Protect against http DDOS attacks
+    stick-table type ip size 500k expire 1m store conn_rate(3s),conn_cur,gpc0,http_req_rate(5s),http_err_rate(10s)
+    tcp-request connection track-sc1 src table Abuse
+    tcp-request connection accept if { src -f /etc/haproxy/abuse/whitelist.lst }
+    tcp-request connection reject if { src_conn_rate(Abuse) ge 90 }
+    tcp-request connection reject if { src_conn_cur(Abuse) ge 50 }
+    tcp-request content reject if { src -f /etc/haproxy/abuse/blacklist.lst }
+    # ABUSE SECTION works with http mode dependent on src ip
+    tcp-request content reject if { src_get_gpc0(Abuse) gt 0 }
+    acl abuse src_http_req_rate(Abuse) ge 150
+    acl flag_abuser src_inc_gpc0(Abuse) ge 0
+    acl scanner src_http_err_rate(Abuse) ge 30
+    # Returns a 403 to the abuser and flags for tcp-reject next time
+    http-request deny if abuse flag_abuser
+    http-request deny if scanner flag_abuser
+
+{{- end }}
+{{- end }}
+
+
+{{- /*------------------------------------*/}}
+{{- if $hasBalance }}
+    http-request set-var(txn.hdr_host) req.hdr(host)
+    http-request set-var(txn.hdr_proto) req.hdr(x-forwarded-proto)
+{{- end }}
+
+{{- /*------------------------------------*/}}
 {{- if or (and $hasBalance $hasHTTPStoHTTP) (not $hasSSL) }}
-    acl from-https var(txn.hdr_proto) https
+    acl from-https var(txn.hdr_proto) -i https
+    acl ssl-offload var(txn.hdr_proto) -i https
 {{- end }}
 {{- if and $hasBalance $hasHTTPStoHTTP (not $reuseHTTPPort) }}
     acl from-https dst_port eq {{ $cfg.HTTPStoHTTPPort }}
@@ -339,35 +394,9 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShar
 
 {{- /*------------------------------------*/}}
 {{- if $hasBalance }}
-{{- range $server := $servers }}
-    {{- template "acl" map $cfg $server "var(txn.hdr_host)" true }}
-{{- end }}
-{{- if $isShared }}
-{{- range $server := $ing.HAPassthrough }}
-    {{- template "acl" map $cfg $server "var(txn.hdr_host)" true }}
-{{- end }}
-{{- end }}
-{{- end }}
-
-{{- /*------------------------------------*/}}
-{{- if $hasBalance }}
-{{- if or $isShared $singleserver.HasRateLimit }}
-    stick-table type ip size 200k expire 5m store conn_cur,conn_rate(1s)
-    tcp-request content track-sc1 src
-{{- end }}
-{{- end }}
-
-{{- /*------------------------------------*/}}
-{{- if $hasBalance }}
 {{- range $snippet := $ing.ConfigFrontend }}
     {{ $snippet }}
 {{- end }}
-{{- end }}
-
-{{- /*------------------------------------*/}}
-{{- if $hasBalance }}
-    http-request set-var(txn.hdr_host) req.hdr(host)
-    http-request set-var(txn.hdr_proto) hdr(x-forwarded-proto)
 {{- end }}
 
 {{- /*------------------------------------*/}}
@@ -387,7 +416,7 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShar
 {{- end }}
 
 {{- /*------------------------------------*/}}
-{{- if not $reuseHTTPPort }}
+{{- if and $hasSSL (not $reuseHTTPPort) }}
     http-request set-header X-Forwarded-Proto https{{ if $hasBalance }} if from-https{{ end }}
 {{- end }}
 
@@ -526,8 +555,8 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShar
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if $isShared }}
 {{- range $server := $ing.HAPassthrough }}
+{{- if eq $server.Hostname $singleserver.Hostname }}
 {{- if eq $server.HTTPPassBackend "" }}
     redirect scheme https if !from-https {{ $server.ACLLabel }}
 {{- end }}
@@ -557,7 +586,8 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShar
 {{- range $server := $servers }}
 {{- $appRoot := $server.RootLocation.Rewrite.AppRoot }}
 {{- if ne $appRoot "" }}
-    redirect location {{ $appRoot }} if {{ $server.ACLLabel }} { var(txn.path) -m str / }
+    # Prefer a redirect prefix instead of redirect location to avoid a redirection to http protocol
+    redirect prefix {{ $appRoot }} if {{ $server.ACLLabel }} { var(txn.path) -m str / }
 {{- end }}
 {{- end }}
 {{- end }}
@@ -609,34 +639,31 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShar
 {{- range $location := $server.Locations }}
 {{- if not $location.IsRootLocation }}
     use_backend {{ $location.Backend }} if {{ $server.ACLLabel }} { var(txn.path) -m beg {{ $location.Path }} }
-{{- else if and $server.ACLLabel (or $cfg.StrictHost (not $location.IsDefBackend)) }}
+{{- else if and $server.ACLLabel (not $location.IsDefBackend) }}
     use_backend {{ $location.Backend }} if {{ $server.ACLLabel }}
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if $isShared }}
 {{- range $server := $ing.HAPassthrough }}
+{{- if eq $server.Hostname $singleserver.Hostname }}
 {{- if ne $server.HTTPPassBackend "" }}
     use_backend {{ $server.HTTPPassBackend }} if {{ $server.ACLLabel }}
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if $isShared }}
-    default_backend httpback-default-backend
-{{- else if $isDefault }}
-    default_backend {{ $ing.DefaultServer.RootLocation.Backend }}
-{{- else if $isCACert }}
+{{- if $isCACert }}
     default_backend httpback-shared-backend
 {{- end }}
+    #default_backend {{ $ing.DefaultServer.RootLocation.Backend }}
+    default_backend error404
 {{- end }}
 
 {{- /*------------------------------------*/}}
 {{- if not $hasBalance }}
-{{- if $isShared }}
-    default_backend httpback-shared-backend
-{{- else if $isCACert }}
-    default_backend httpback-{{ $singleserver.HostnameLabel }}
+{{- if $isCACert }}
+    default_backend httpback-ca-{{ $singleserver.HostnameLabel }}
 {{- end }}
+    default_backend httpback-shared-backend
 {{- end }}
 
 {{- end }}{{/* define "http_front" */}}
@@ -652,13 +679,13 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ if $isShar
 {{- if $server.HostnameIsWildcard }}
     acl {{ $server.ACLLabel }} {{ $fetch }} -m reg -i {{ hostnameRegex $server.Hostname }}
 {{- else }}
-    acl {{ $server.ACLLabel }} {{ $fetch }} -i {{ $server.Hostname }}{{ if $needport }} {{ $server.Hostname }}:{{ $cfg.HTTPPort }} {{ $server.Hostname }}:{{ $cfg.HTTPSPort }}{{ if and $cfg.HTTPStoHTTPPort (ne $cfg.HTTPStoHTTPPort $cfg.HTTPPort) }} {{ $server.Hostname }}:{{ $cfg.HTTPStoHTTPPort }}{{ end }}{{ end }}
+    acl {{ $server.ACLLabel }} {{ $fetch }} -i {{ $server.Hostname }}{{ if $needport }} {{ $server.Hostname }}:{{ $cfg.HTTPPort }} {{ $server.Hostname }}:{{template "get_https_port" map $cfg.HTTPSPort $server.Hostname}}{{ if and $cfg.HTTPStoHTTPPort (ne $cfg.HTTPStoHTTPPort $cfg.HTTPPort) }} {{ $server.Hostname }}:{{ $cfg.HTTPStoHTTPPort }}{{ end }}{{ end }}
 {{- end }}
 {{- if $server.AliasHost }}
 {{- if $server.AliasHostIsRegex }}
     acl {{ $server.ACLLabel }} {{ $fetch }} -m reg -i '{{ hostnameRegex $server.AliasHost }}'
 {{- else }}
-    acl {{ $server.ACLLabel }} {{ $fetch }} -i {{ $server.AliasHost }}{{ if $needport }} {{ $server.AliasHost }}:{{ $cfg.HTTPPort }} {{ $server.AliasHost }}:{{ $cfg.HTTPSPort }}{{ end }}
+    acl {{ $server.ACLLabel }} {{ $fetch }} -i {{ $server.AliasHost }}{{ if $needport }} {{ $server.AliasHost }}:{{ $cfg.HTTPPort }} {{ $server.AliasHost }}:{{template "get_https_port" map $cfg.HTTPSPort $server.Hostname}}{{ end }}
 {{- end }}
 {{- end }}
 {{- if $server.AliasRegex }}
@@ -723,6 +750,10 @@ backend error496
     mode http
     errorfile 400 /usr/local/etc/haproxy/errors/496.http
     http-request deny deny_status 400
+backend error404
+    mode http
+    option forwardfor
+    errorfile 503 /usr/local/etc/haproxy/errors/404.http
 listen error503noendpoints
     bind 127.0.0.1:8181{{ if gt $ing.Procs.Nbproc 1 }} process {{ $ing.Procs.BindprocBalance }}{{ end }}
     mode http
@@ -736,23 +767,56 @@ listen stats
 {{- if ne $ssl.PemSHA "" }}
     # CRT PEM checksum: {{ $ssl.PemSHA }}
 {{- end }}
-    bind {{ $cfg.BindIPAddrStats }}:{{ $cfg.StatsPort }}{{ if ne $ssl.PemFileName "" }} ssl crt {{ $ssl.PemFileName }}{{ end }}{{ if $cfg.StatsProxyProtocol }} accept-proxy{{ end }}{{ if gt $ing.Procs.Nbproc 1 }} process 1{{ end }}
+    bind {{ $cfg.BindIPAddrStats }}:{{ $cfg.StatsPort }}{{ if ne $ssl.PemFileName "" }} ssl crt {{ $ssl.PemFileName }}{{ end }}{{ if $cfg.StatsProxyProtocol }} accept-proxy{{ end }}
+    bind-process 1
     mode http
     stats enable
     stats realm HAProxy\ Statistics
 {{- if ne $cfg.StatsAuth "" }}
     stats auth {{ $cfg.StatsAuth }}
 {{- end }}
-    stats uri /
+    stats uri /stats
     no log
     option forceclose
     stats show-legends
+
+{{- if gt $ing.Procs.Nbproc 1 }}
+listen stats2
+{{- if ne $ssl.PemSHA "" }}
+    # CRT PEM checksum: {{ $ssl.PemSHA }}
+{{- end }}
+    bind {{ $cfg.BindIPAddrStats }}:1937{{ if ne $ssl.PemFileName "" }} ssl crt {{ $ssl.PemFileName }}{{ end }}{{ if $cfg.StatsProxyProtocol }} accept-proxy{{ end }}
+    bind-process 2
+    mode http
+    stats enable
+    stats realm HAProxy\ Statistics
+{{- if ne $cfg.StatsAuth "" }}
+    stats auth {{ $cfg.StatsAuth }}
+{{- end }}
+    stats uri /stats
+    no log
+    option forceclose
+    stats show-legends
+{{- end }}
 
 ######
 ###### Monitor URI
 ######
 frontend healthz
-    bind {{ $cfg.BindIPAddrHealthz }}:{{ $cfg.HealthzPort }}{{ if gt $ing.Procs.Nbproc 1 }} process 1{{ end }}
+    bind {{ $cfg.BindIPAddrHealthz }}:{{ $cfg.HealthzPort }}
     mode http
     monitor-uri /healthz
     no log
+
+#####
+##### Declare "Abuse" stick table which track request, for DDOS defence
+#####
+backend Abuse
+    stick-table type ip size 500k expire 1m store conn_rate(3s),conn_cur,gpc0,http_req_rate(5s),http_err_rate(10s)
+
+
+{{- define "get_https_port"}}
+{{- $defaultHttpsPort := .p1 }}
+{{- $hostname := .p2 }}
+{{- if contains "sun-apps" $hostname }}443{{- else if contains "sun-admin" $hostname }}9443{{ else if contains "sun-push" $hostname }}10443{{- else }}{{ $defaultHttpsPort }}{{ end }}
+{{- end }}{{/* define "get_https_port" */}}
