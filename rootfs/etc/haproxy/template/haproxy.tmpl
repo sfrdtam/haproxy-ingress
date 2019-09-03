@@ -258,6 +258,7 @@ backend httpback-{{ $server.HostnameLabel }}
     http-request del-header {{ $cfg.SSLHeadersPrefix }}-Client-SHA1
     http-request del-header {{ $cfg.SSLHeadersPrefix }}-Client-DN
     http-request del-header {{ $cfg.SSLHeadersPrefix }}-Client-CN
+    timeout server 600s # set the largest timeout server waiting to http balancing
     server {{ $server.HostnameLabel }} unix@/var/run/haproxy-http-{{ $server.HostnameSocket }}.sock send-proxy-v2
 
 {{- template "http_front" map $ing $cfg $server true (eq $ing.Procs.NbprocSSL 0) }}
