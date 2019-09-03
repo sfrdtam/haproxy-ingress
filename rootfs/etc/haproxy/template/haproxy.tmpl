@@ -304,7 +304,7 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
 {{- if and $hasBalance }}
     {{ template "bind_on_http" map $cfg.HTTPPort $singleserver.Hostname $cfg.UseProxyProtocol }}
 {{- if and $hasHTTPStoHTTP (not $reuseHTTPPort) }}
-    bind {{ $cfg.BindIPAddrHTTP }}:{{ $cfg.HTTPStoHTTPPort }}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }}
+    bind {{ $cfg.BindIPAddrHTTP }}:{{template "get_https_to_http_port" map $cfg.HTTPStoHTTPPort $singleserver.Hostname}}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }}
 {{- end }}
 {{- end }}
 {{- if $hasSSL }}
@@ -386,7 +386,7 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
     acl ssl-offload var(txn.hdr_proto) -i https
 {{- end }}
 {{- if and $hasBalance $hasHTTPStoHTTP (not $reuseHTTPPort) }}
-    acl from-https dst_port eq {{ $cfg.HTTPStoHTTPPort }}
+    acl from-https dst_port eq {{template "get_https_to_http_port" map $cfg.HTTPStoHTTPPort $singleserver.Hostname}}
 {{- end }}
 {{- if and $hasSSL $hasBalance }}
     acl from-https ssl_fc
@@ -680,7 +680,7 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
 {{- if $server.HostnameIsWildcard }}
     acl {{ $server.ACLLabel }} {{ $fetch }} -m reg -i {{ hostnameRegex $server.Hostname }}
 {{- else }}
-    acl {{ $server.ACLLabel }} {{ $fetch }} -i {{ $server.Hostname }}{{ if $needport }} {{ $server.Hostname }}:{{ $cfg.HTTPPort }} {{ $server.Hostname }}:{{template "get_https_port" map $cfg.HTTPSPort $server.Hostname}}{{ if and $cfg.HTTPStoHTTPPort (ne $cfg.HTTPStoHTTPPort $cfg.HTTPPort) }} {{ $server.Hostname }}:{{ $cfg.HTTPStoHTTPPort }}{{ end }}{{ end }}
+    acl {{ $server.ACLLabel }} {{ $fetch }} -i {{ $server.Hostname }}{{ if $needport }} {{ $server.Hostname }}:{{ $cfg.HTTPPort }} {{ $server.Hostname }}:{{template "get_https_port" map $cfg.HTTPSPort $server.Hostname}}{{ if and $cfg.HTTPStoHTTPPort (ne $cfg.HTTPStoHTTPPort $cfg.HTTPPort) }} {{ $server.Hostname }}:{{template "get_https_to_http_port" map $cfg.HTTPStoHTTPPort $server.Hostname}}{{ end }}{{ end }}
 {{- end }}
 {{- if $server.AliasHost }}
 {{- if $server.AliasHostIsRegex }}
@@ -823,6 +823,12 @@ backend Abuse
 {{- $hostname := .p2 }}
 {{- if contains "sun-apps" $hostname }}443{{- else if contains "sun-admin" $hostname }}9443{{ else if contains "sun-push" $hostname }}10443{{- else }}{{ $defaultHttpsPort }}{{ end }}
 {{- end }}{{/* define "get_https_port" */}}
+
+{{- define "get_https_to_http_port"}}
+{{- $defaultHttpsToHttpPort := .p1 }}
+{{- $hostname := .p2 }}
+{{- if contains "sun-apps" $hostname }}444{{- else if contains "sun-admin" $hostname }}9444{{ else if contains "sun-push" $hostname }}10444{{- else if contains "sun-si" $hostname }}11444{{- else }}{{ $defaultHttpsToHttpPort }}{{ end }}
+{{- end }}{{/* define "get_https_to_http_port" */}}
 
 {{- define "get_http_port"}}
 {{- $defaultHttpPort := .p1 }}
