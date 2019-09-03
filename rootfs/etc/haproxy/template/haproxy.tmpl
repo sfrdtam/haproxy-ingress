@@ -301,7 +301,7 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
 
 {{- /*------------------------------------*/}}
 {{- if and $hasBalance }}
-    bind {{ $cfg.BindIPAddrHTTP }}:{{ $cfg.HTTPPort }}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }}
+    {{ template "bind_on_http" map $cfg.HTTPPort $singleserver.Hostname $cfg.UseProxyProtocol }}
 {{- if and $hasHTTPStoHTTP (not $reuseHTTPPort) }}
     bind {{ $cfg.BindIPAddrHTTP }}:{{ $cfg.HTTPStoHTTPPort }}{{ if $cfg.UseProxyProtocol }} accept-proxy{{ end }}
 {{- end }}
@@ -822,3 +822,19 @@ backend Abuse
 {{- $hostname := .p2 }}
 {{- if contains "sun-apps" $hostname }}443{{- else if contains "sun-admin" $hostname }}9443{{ else if contains "sun-push" $hostname }}10443{{- else }}{{ $defaultHttpsPort }}{{ end }}
 {{- end }}{{/* define "get_https_port" */}}
+
+{{- define "get_http_port"}}
+{{- $defaultHttpPort := .p1 }}
+{{- $hostname := .p2 }}
+{{- if contains "sun-si" $hostname }}1180{{- else }}{{ $defaultHttpPort }}{{ end }}
+{{- end }}{{/* define "get_http_port" */}}
+
+{{- define "bind_on_http"}}
+    {{- $defaultHttpPort := .p1 }}
+    {{- $hostname := .p2 }}
+    {{- $useProxyProtocol := .p3 }}
+    {{- if or (contains "sun-si" $hostname) (contains "sun-apps" $hostname) }}
+    bind *:{{template "get_http_port" map $defaultHttpPort $hostname}}{{ if $useProxyProtocol }} accept-proxy{{ end }}
+    {{- end }}
+{{- end }}{{/* define "get_http_port" */}}
+
