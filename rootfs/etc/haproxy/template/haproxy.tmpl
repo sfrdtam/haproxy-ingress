@@ -813,7 +813,9 @@ frontend healthz
 #####
 backend Abuse
     stick-table type ip size 500k expire 1m store conn_rate(3s),conn_cur,gpc0,http_req_rate(5s),http_err_rate(10s)
-
+{{- if gt $ing.Procs.Nbproc 1 }}
+    bind-process {{ $ing.Procs.BindprocBalance }}
+{{- end}}
 
 {{- define "get_https_port"}}
 {{- $defaultHttpsPort := .p1 }}
