@@ -351,28 +351,6 @@ frontend http{{ if and $hasSSL (not $hasBalance) }}s{{ end }}front-{{ $singleser
     acl {{ $singleserver.ACLLabel }} always_true
 {{- end }}
 
-{{- /*------------------------------------*/}}
-{{- if $hasBalance }}
-{{- if not (contains "sun-push" $singleserver.Hostname ) }}
-    # Protect against http DDOS attacks
-    stick-table type ip size 500k expire 1m store conn_rate(3s),conn_cur,gpc0,http_req_rate(5s),http_err_rate(10s)
-    tcp-request connection track-sc1 src table Abuse
-    tcp-request connection accept if { src -f /etc/haproxy/abuse/whitelist.lst }
-    tcp-request connection reject if { src_conn_rate(Abuse) ge 90 }
-    tcp-request connection reject if { src_conn_cur(Abuse) ge 50 }
-    tcp-request content reject if { src -f /etc/haproxy/abuse/blacklist.lst }
-    # ABUSE SECTION works with http mode dependent on src ip
-    tcp-request content reject if { src_get_gpc0(Abuse) gt 0 }
-    acl abuse src_http_req_rate(Abuse) ge 150
-    acl flag_abuser src_inc_gpc0(Abuse) ge 0
-    acl scanner src_http_err_rate(Abuse) ge 30
-    # Returns a 403 to the abuser and flags for tcp-reject next time
-    http-request deny if abuse flag_abuser
-    http-request deny if scanner flag_abuser
-
-{{- end }}
-{{- end }}
-
 
 {{- /*------------------------------------*/}}
 {{- if $hasBalance }}
@@ -776,10 +754,11 @@ listen stats
 {{- if ne $cfg.StatsAuth "" }}
     stats auth {{ $cfg.StatsAuth }}
 {{- end }}
-    stats uri /stats
+    stats uri /haproxy/stats
     no log
     option forceclose
     stats show-legends
+    stats show-node
 
 {{- if gt $ing.Procs.Nbproc 1 }}
 listen stats2
@@ -794,10 +773,11 @@ listen stats2
 {{- if ne $cfg.StatsAuth "" }}
     stats auth {{ $cfg.StatsAuth }}
 {{- end }}
-    stats uri /stats
+    stats uri /haproxy/stats
     no log
     option forceclose
     stats show-legends
+    stats show-node
 {{- end }}
 
 ######
@@ -808,15 +788,6 @@ frontend healthz
     mode http
     monitor-uri /healthz
     no log
-
-#####
-##### Declare "Abuse" stick table which track request, for DDOS defence
-#####
-backend Abuse
-    stick-table type ip size 500k expire 1m store conn_rate(3s),conn_cur,gpc0,http_req_rate(5s),http_err_rate(10s)
-{{- if gt $ing.Procs.Nbproc 1 }}
-    bind-process {{ $ing.Procs.BindprocBalance }}
-{{- end}}
 
 {{- define "get_https_port"}}
 {{- $defaultHttpsPort := .p1 }}
